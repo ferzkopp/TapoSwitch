@@ -1,0 +1,29 @@
+# User-specific configuration files with credentials
+App.config.user
+
+# Build outputs
+bin/
+obj/
+
+# Visual Studio user-specific files
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Visual Studio code coverage results
+*.coverage
+*.coveragexml
+
+# NuGet Packages
+*.nupkg
+packages/
+
+# User-specific files
+*.userprefs
+
+# Rider
+.idea/
+
+# VS Code
+.vscode/
