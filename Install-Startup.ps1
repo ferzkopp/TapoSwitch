@@ -533,9 +533,5 @@ if ($Uninstall) {
 }
 
 Write-Host ""
-
-# Pause at the end if running from batch file or if window will close
-if ($Host.Name -eq "ConsoleHost") {
-    Write-Host "Press any key to close this window..." -ForegroundColor Gray
-    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
-}
+Write-Host "Press Enter to continue..." -ForegroundColor Gray
+$null = Read-Host

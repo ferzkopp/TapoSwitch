@@ -39,6 +39,7 @@ if exist "%RELEASE_EXE%" (
 echo Executable: %EXE_PATH%
 echo.
 
+:menu
 REM Offer choice
 echo Choose an option:
 echo   1. Install (with configuration)
@@ -54,14 +55,16 @@ if errorlevel 1 goto :install
 :install
 echo.
 echo Installing TapoSwitch (requires admin)...
-powershell.exe -NoExit -ExecutionPolicy Bypass -File "%~dp0Install-Startup.ps1"
-goto :done
+powershell.exe -ExecutionPolicy Bypass -File "%~dp0Install-Startup.ps1"
+echo.
+goto :menu
 
 :uninstall
 echo.
 echo Uninstalling TapoSwitch (requires admin)...
-powershell.exe -NoExit -ExecutionPolicy Bypass -File "%~dp0Install-Startup.ps1" -Uninstall
-goto :done
+powershell.exe -ExecutionPolicy Bypass -File "%~dp0Install-Startup.ps1" -Uninstall
+echo.
+goto :menu
 
 :cancel
 echo.
