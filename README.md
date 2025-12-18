@@ -14,6 +14,7 @@ This is useful for turning external audio equipment (monitors, mixers) that are 
 - 🔄 **Auto-Shutdown**: Automatically turns off device when you log off or shut down Windows
 - 🔒 **Secure**: Supports both SecurePassthrough and KLAP protocols
 - 💾 **Lightweight**: Minimal resource usage, runs quietly in the background
+- 🔁 **Auto-Reconnect**: Automatically reconnects if connection is lost, with configurable retry attempts
 - ⚙️ **Easy Installation**: Automated installer with interactive configuration
 - 🔧 **Configurable**: Set device credentials and IP address during installation
 
@@ -131,6 +132,8 @@ TapoSwitch\bin\Release\net9.0-windows\TapoSwitch.dll.config
 | `Password` | Your Tapo account password | *(required)* | Any string |
 | `IpAddress` | Local IP address of your Tapo device | *(required)* | Valid IPv4 address |
 | `ShutdownTimeoutSeconds` | Timeout in seconds to wait for device to turn off during system shutdown/logoff | `2` | Positive integer (1-10 recommended) |
+| `ConnectionRetryAttempts` | Number of retry attempts when connection fails | `3` | Positive integer |
+| `RetryDelayMilliseconds` | Base delay between retry attempts (uses exponential backoff) | `2000` | Positive integer (milliseconds) |
 
 **About ShutdownTimeoutSeconds:**
 - Controls how long the application waits for the device to turn off when Windows is shutting down or logging off

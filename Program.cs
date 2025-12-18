@@ -46,25 +46,99 @@ namespace TapoSwitch
                 : 2;
 
         /// <summary>
+        /// Gets the connection retry attempts from application settings. Default is 3.
+        /// </summary>
+        public static readonly int ConnectionRetryAttempts = 
+            int.TryParse(ConfigurationManager.AppSettings["ConnectionRetryAttempts"], out var retries) && retries > 0
+                ? retries
+                : 3;
+
+        /// <summary>
+        /// Gets the retry delay in milliseconds from application settings. Default is 2000ms.
+        /// </summary>
+        public static readonly int RetryDelayMilliseconds = 
+            int.TryParse(ConfigurationManager.AppSettings["RetryDelayMilliseconds"], out var delay) && delay > 0
+                ? delay
+                : 2000;
+
+        /// <summary>
+        /// Maximum delay in milliseconds for exponential backoff. Default is 30000ms (30 seconds).
+        /// </summary>
+        private const int MaxRetryDelayMilliseconds = 30000;
+
+        /// <summary>
+        /// Maximum length for Windows tooltip text (63 characters + null terminator).
+        /// </summary>
+        private const int MaxTooltipLength = 63;
+
+        /// <summary>
         /// The main entry point for the application.
         /// </summary>
         [STAThread]
         static void Main()
         {
+            // Validate configuration at startup
+            if (!ValidateConfiguration(out string validationError))
+            {
+                MessageBox.Show(
+                    $"Configuration Error: {validationError}\n\nPlease check your App.config file.",
+                    "TapoSwitch Configuration Error",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+                return;
+            }
+
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
             // Set the default font for the application (example: Microsoft Sans Serif, 8.25pt)
-            Application.SetDefaultFont(new Font("Microsoft Sans Serif", 8.25F));
+            using var font = new Font("Microsoft Sans Serif", 8.25F);
+            Application.SetDefaultFont(font);
 
             var context = new CustomApplicationContext();
             Application.Run(context);
         }
 
         /// <summary>
+        /// Validates critical configuration settings at startup.
+        /// </summary>
+        /// <param name="errorMessage">Error message if validation fails.</param>
+        /// <returns>True if configuration is valid, false otherwise.</returns>
+        private static bool ValidateConfiguration(out string errorMessage)
+        {
+            if (string.IsNullOrWhiteSpace(Username))
+            {
+                errorMessage = "Username is missing or empty.";
+                return false;
+            }
+
+            if (string.IsNullOrWhiteSpace(Password))
+            {
+                errorMessage = "Password is missing or empty.";
+                return false;
+            }
+
+            if (string.IsNullOrWhiteSpace(IpAddress))
+            {
+                errorMessage = "IpAddress is missing or empty.";
+                return false;
+            }
+
+            // Validate IP address format
+            if (!System.Net.IPAddress.TryParse(IpAddress, out _))
+            {
+                errorMessage = $"IpAddress '{IpAddress}' is not a valid IP address.";
+                return false;
+            }
+
+            errorMessage = null;
+            return true;
+        }
+
+        /// <summary>
         /// Provides the application context for the TapoSwitch tray application, including tray icon and device control.
         /// </summary>
-        public class CustomApplicationContext : ApplicationContext
+        public class CustomApplicationContext : ApplicationContext, IDisposable
         {
             /// <summary>
             /// The tray icon displayed in the system tray.
@@ -89,12 +163,37 @@ namespace TapoSwitch
             /// <summary>
             /// Indicates the current power state of the device.
             /// </summary>
-            bool state = false;
+            private volatile bool state = false;
 
             /// <summary>
             /// Indicates whether the application is shutting down.
             /// </summary>
-            private bool isShuttingDown = false;
+            private volatile bool isShuttingDown = false;
+
+            /// <summary>
+            /// Indicates whether the device is currently connected.
+            /// </summary>
+            private volatile bool isConnected = false;
+
+            /// <summary>
+            /// Lock object for thread-safe operations.
+            /// </summary>
+            private readonly SemaphoreSlim connectionLock = new SemaphoreSlim(1, 1);
+
+            /// <summary>
+            /// Background timer for periodic connection checks.
+            /// </summary>
+            private System.Threading.Timer connectionCheckTimer;
+
+            /// <summary>
+            /// Synchronization context for UI thread marshaling.
+            /// </summary>
+            private readonly SynchronizationContext syncContext;
+
+            /// <summary>
+            /// Tracks whether Dispose has been called.
+            /// </summary>
+            private bool disposed = false;
 
             /// <summary>
             /// Initializes a new instance of the <see cref="CustomApplicationContext"/> class.
@@ -102,15 +201,17 @@ namespace TapoSwitch
             /// </summary>
             public CustomApplicationContext()
             {
+                // Capture UI synchronization context
+                syncContext = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
+
                 // Initialize Tray Icon
                 ContextMenuStrip contextMenuStrip = new ContextMenuStrip();
                 contextMenuStrip.Items.Add("Exit", null, Exit);
 
-                string tooltipText = 
-                    deviceInfo == null ? "Click to toggle switch." : "Click to toggle " + deviceInfo.Model + " (" + deviceInfo.Nickname + ") switch.";
+                string tooltipText = "Connecting to device...";
                 trayIcon = new NotifyIcon()
                 {
-                    Icon = state ? Resources.SwitchOn : Resources.SwitchOff,
+                    Icon = Resources.SwitchOff,
                     Text = tooltipText,
                     ContextMenuStrip = contextMenuStrip,
                     Visible = true
@@ -128,21 +229,79 @@ namespace TapoSwitch
 
                 // Start async initialization after message loop starts
                 Task.Run(() => InitializeAsync());
+
+                // Start periodic connection check (every 30 seconds)
+                var connectionCheckInterval = TimeSpan.FromSeconds(30);
+                connectionCheckTimer = new System.Threading.Timer(
+                    ConnectionCheckCallback,
+                    null,
+                    connectionCheckInterval,
+                    connectionCheckInterval);
+            }
+
+            /// <summary>
+            /// Timer callback that safely handles connection checks.
+            /// </summary>
+            private async void ConnectionCheckCallback(object state)
+            {
+                try
+                {
+                    await EnsureConnectionAsync().ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Prevent unhandled exceptions from crashing the app
+                }
             }
 
             /// <summary>
             /// Asynchronously initializes the device connection and ensures the device is off at startup.
+            /// Retries on failure until successful or application shutdown.
             /// </summary>
             private async Task InitializeAsync()
             {
-                try
+                int attempt = 0;
+                while (!isShuttingDown && !isConnected)
                 {
-                    await InitializeConnection();
-                    await TurnOffAsync();
-                }
-                catch
-                {
-                    // Silently fail on initialization - user can try to toggle later
+                    attempt++;
+                    try
+                    {
+                        await InitializeConnection().ConfigureAwait(false);
+                        await SyncDeviceStateAsync().ConfigureAwait(false);
+                        await TurnOffAsync().ConfigureAwait(false);
+                        
+                        isConnected = true;
+                        InvokeOnUIThread(() =>
+                        {
+                            if (!isShuttingDown)
+                            {
+                                UpdateTrayIcon();
+                                UpdateTooltip();
+                            }
+                        });
+                        break;
+                    }
+                    catch (Exception ex) when (IsNetworkException(ex))
+                    {
+                        // Network issue - will retry
+                        int delayMs;
+                        if (attempt < ConnectionRetryAttempts)
+                        {
+                            // Exponential backoff capped at MaxRetryDelayMilliseconds
+                            delayMs = Math.Min(RetryDelayMilliseconds * attempt, MaxRetryDelayMilliseconds);
+                        }
+                        else
+                        {
+                            // Keep retrying but with capped delay
+                            delayMs = MaxRetryDelayMilliseconds;
+                        }
+                        await Task.Delay(delayMs).ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        // Non-network exception - wait and retry with capped delay
+                        await Task.Delay(Math.Min(RetryDelayMilliseconds * 3, MaxRetryDelayMilliseconds)).ConfigureAwait(false);
+                    }
                 }
             }
 
@@ -151,22 +310,53 @@ namespace TapoSwitch
             /// </summary>
             public async Task InitializeConnection()
             {
-                deviceClient = new TapoDeviceClient(new List<ITapoDeviceClient>
+                await connectionLock.WaitAsync().ConfigureAwait(false);
+                try
                 {
-                    new SecurePassthroughDeviceClient(),
-                    new KlapDeviceClient(),
-                });
+                    deviceClient = new TapoDeviceClient(new List<ITapoDeviceClient>
+                    {
+                        new SecurePassthroughDeviceClient(),
+                        new KlapDeviceClient(),
+                    });
 
-                deviceKey = await deviceClient.LoginByIpAsync(IpAddress, Username, Password);
-                deviceInfo = await deviceClient.GetDeviceInfoAsync(deviceKey);
+                    deviceKey = await deviceClient.LoginByIpAsync(IpAddress, Username, Password).ConfigureAwait(false);
+                    deviceInfo = await deviceClient.GetDeviceInfoAsync(deviceKey).ConfigureAwait(false);
+                }
+                finally
+                {
+                    connectionLock.Release();
+                }
             }
 
             /// <summary>
-            /// Asynchronously retrieves the latest device information.
+            /// Ensures the connection is active, reconnecting if necessary.
             /// </summary>
-            public async Task GetDeviceInfoAsync()
+            private async Task EnsureConnectionAsync()
             {
-                var deviceInfo = await deviceClient.GetDeviceInfoAsync(deviceKey);
+                if (isShuttingDown)
+                    return;
+
+                if (!isConnected)
+                {
+                    await InitializeAsync().ConfigureAwait(false);
+                }
+            }
+
+            /// <summary>
+            /// Synchronizes local state with actual device state.
+            /// </summary>
+            private async Task SyncDeviceStateAsync()
+            {
+                try
+                {
+                    var info = await deviceClient.GetDeviceInfoAsync(deviceKey).ConfigureAwait(false);
+                    state = info.DeviceOn;
+                }
+                catch
+                {
+                    // If we can't sync, assume off for safety
+                    state = false;
+                }
             }
 
             /// <summary>
@@ -174,7 +364,11 @@ namespace TapoSwitch
             /// </summary>
             public async Task TurnOnAsync()
             {
-                await ExecuteWithReconnectAsync(() => deviceClient.SetPowerAsync(deviceKey, true));
+                await ExecuteWithReconnectAsync(async () =>
+                {
+                    await deviceClient.SetPowerAsync(deviceKey, true).ConfigureAwait(false);
+                    state = true;
+                }).ConfigureAwait(false);
             }
 
             /// <summary>
@@ -182,33 +376,93 @@ namespace TapoSwitch
             /// </summary>
             public async Task TurnOffAsync()
             {
-                await ExecuteWithReconnectAsync(() => deviceClient.SetPowerAsync(deviceKey, false));
+                await ExecuteWithReconnectAsync(async () =>
+                {
+                    await deviceClient.SetPowerAsync(deviceKey, false).ConfigureAwait(false);
+                    state = false;
+                }).ConfigureAwait(false);
             }
 
             /// <summary>
             /// Executes an action with automatic reconnection on network errors.
+            /// Retries multiple times with exponential backoff.
             /// </summary>
             private async Task ExecuteWithReconnectAsync(Func<Task> action)
             {
-                try
-                {
-                    await action();
-                }
-                catch (Exception ex) when (IsNetworkException(ex) && !isShuttingDown)
+                for (int attempt = 0; attempt < ConnectionRetryAttempts; attempt++)
                 {
                     try
                     {
-                        await InitializeConnection();
-                        await action();
+                        await action().ConfigureAwait(false);
+                        isConnected = true;
+                        InvokeOnUIThread(() =>
+                        {
+                            if (!isShuttingDown)
+                            {
+                                UpdateTooltip();
+                            }
+                        });
+                        return;
                     }
-                    catch
+                    catch (Exception ex) when (IsNetworkException(ex) && !isShuttingDown)
                     {
-                        // Silently fail after reconnection attempt
+                        isConnected = false;
+                        
+                        // Last attempt failed
+                        if (attempt == ConnectionRetryAttempts - 1)
+                        {
+                            InvokeOnUIThread(() =>
+                            {
+                                if (!isShuttingDown)
+                                {
+                                    UpdateTooltip("Connection lost. Will retry automatically.");
+                                }
+                            });
+                            // Trigger background reconnection
+                            _ = Task.Run(() => InitializeAsync());
+                            throw;
+                        }
+
+                        // Wait before retry with exponential backoff capped at MaxRetryDelayMilliseconds
+                        int delayMs = Math.Min(RetryDelayMilliseconds * (attempt + 1), MaxRetryDelayMilliseconds);
+                        await Task.Delay(delayMs).ConfigureAwait(false);
+
+                        try
+                        {
+                            await InitializeConnection().ConfigureAwait(false);
+                        }
+                        catch
+                        {
+                            // Will retry in next iteration
+                        }
+                    }
+                    catch (Exception) when (!isShuttingDown)
+                    {
+                        // Non-network exception
+                        InvokeOnUIThread(() =>
+                        {
+                            if (!isShuttingDown)
+                            {
+                                UpdateTooltip("Device error occurred.");
+                            }
+                        });
+                        throw;
                     }
                 }
-                catch
+            }
+
+            /// <summary>
+            /// Marshals an action to the UI thread.
+            /// </summary>
+            private void InvokeOnUIThread(Action action)
+            {
+                if (syncContext != null && !isShuttingDown)
                 {
-                    // Silently fail for non-network exceptions
+                    syncContext.Post(_ => action(), null);
+                }
+                else if (!isShuttingDown)
+                {
+                    action();
                 }
             }
 
@@ -220,7 +474,58 @@ namespace TapoSwitch
                 return ex is HttpRequestException ||
                        ex is SocketException ||
                        ex is TaskCanceledException ||
-                       ex is OperationCanceledException;
+                       ex is OperationCanceledException ||
+                       (ex.InnerException != null && IsNetworkException(ex.InnerException));
+            }
+
+            /// <summary>
+            /// Truncates tooltip text to Windows maximum length (63 characters).
+            /// </summary>
+            private string TruncateTooltip(string text)
+            {
+                if (string.IsNullOrEmpty(text))
+                    return text;
+
+                if (text.Length <= MaxTooltipLength)
+                    return text;
+
+                return text.Substring(0, MaxTooltipLength - 3) + "...";
+            }
+
+            /// <summary>
+            /// Updates the tray icon based on current state.
+            /// </summary>
+            private void UpdateTrayIcon()
+            {
+                if (isShuttingDown || disposed)
+                    return;
+
+                trayIcon.Icon = state ? Resources.SwitchOn : Resources.SwitchOff;
+            }
+
+            /// <summary>
+            /// Updates the tooltip with device information or status message.
+            /// </summary>
+            private void UpdateTooltip(string customMessage = null)
+            {
+                if (isShuttingDown || disposed)
+                    return;
+
+                string tooltipText;
+                if (customMessage != null)
+                {
+                    tooltipText = customMessage;
+                }
+                else if (isConnected && deviceInfo != null)
+                {
+                    tooltipText = $"Click to toggle {deviceInfo.Model} ({deviceInfo.Nickname}) switch.";
+                }
+                else
+                {
+                    tooltipText = "Connecting to device...";
+                }
+
+                trayIcon.Text = TruncateTooltip(tooltipText);
             }
 
             /// <summary>
@@ -233,17 +538,37 @@ namespace TapoSwitch
                 // Left mouse button toggles
                 if (e.Button == MouseButtons.Left)
                 {
-                    state = !state;
-                    if (state)
+                    if (!isConnected)
                     {
-                        await TurnOnAsync();
-                    }
-                    else
-                    {
-                        await TurnOffAsync();
+                        // Trigger immediate reconnection attempt
+                        UpdateTooltip("Reconnecting...");
+                        _ = Task.Run(() => InitializeAsync());
+                        return;
                     }
 
-                    trayIcon.Icon = state ? Resources.SwitchOn : Resources.SwitchOff;
+                    try
+                    {
+                        if (state)
+                        {
+                            await TurnOffAsync().ConfigureAwait(false);
+                        }
+                        else
+                        {
+                            await TurnOnAsync().ConfigureAwait(false);
+                        }
+
+                        InvokeOnUIThread(() =>
+                        {
+                            if (!isShuttingDown)
+                            {
+                                UpdateTrayIcon();
+                            }
+                        });
+                    }
+                    catch
+                    {
+                        // Error already handled in ExecuteWithReconnectAsync
+                    }
                 }
             }
 
@@ -269,7 +594,7 @@ namespace TapoSwitch
                     {
                         try
                         {
-                            await TurnOffAsync();
+                            await TurnOffAsync().ConfigureAwait(false);
                         }
                         catch
                         {
@@ -293,7 +618,7 @@ namespace TapoSwitch
                     e.Cancel = false;
                     
                     // Clean up
-                    trayIcon.Visible = false;
+                    Dispose();
                     
                     // If this is a logoff, we can exit cleanly
                     if (e.Reason == SessionEndReasons.Logoff)
@@ -317,9 +642,14 @@ namespace TapoSwitch
                             isShuttingDown = true;
                             try
                             {
-                                await TurnOffAsync();
-                                state = false;
-                                trayIcon.Icon = Resources.SwitchOff;
+                                await TurnOffAsync().ConfigureAwait(false);
+                                InvokeOnUIThread(() =>
+                                {
+                                    if (!isShuttingDown)
+                                    {
+                                        UpdateTrayIcon();
+                                    }
+                                });
                             }
                             catch
                             {
@@ -336,10 +666,7 @@ namespace TapoSwitch
             private void OnApplicationExit(object sender, EventArgs e)
             {
                 isShuttingDown = true;
-                
-                // Unregister session events
-                SystemEvents.SessionEnding -= OnSessionEnding;
-                SystemEvents.SessionSwitch -= OnSessionSwitch;
+                Dispose();
             }
 
             /// <summary>
@@ -353,49 +680,60 @@ namespace TapoSwitch
 
                 try
                 {
-                    await TurnOffAsync();
+                    await TurnOffAsync().ConfigureAwait(false);
                 }
                 catch
                 {
                     // Silently fail on exit
                 }
 
-                trayIcon.Visible = false;
+                if (!disposed)
+                {
+                    trayIcon.Visible = false;
+                }
                 Application.Exit();
+            }
+
+            /// <summary>
+            /// Disposes of managed resources.
+            /// </summary>
+            public new void Dispose()
+            {
+                Dispose(true);
+                GC.SuppressFinalize(this);
+            }
+
+            /// <summary>
+            /// Disposes of managed resources.
+            /// </summary>
+            /// <param name="disposing">True if called from Dispose(), false if called from finalizer.</param>
+            protected override void Dispose(bool disposing)
+            {
+                if (!disposed)
+                {
+                    if (disposing)
+                    {
+                        // Dispose managed resources
+                        connectionCheckTimer?.Dispose();
+                        connectionLock?.Dispose();
+                        
+                        if (trayIcon != null)
+                        {
+                            trayIcon.Visible = false;
+                            trayIcon.Dispose();
+                        }
+                        
+                        // Unregister session events
+                        SystemEvents.SessionEnding -= OnSessionEnding;
+                        SystemEvents.SessionSwitch -= OnSessionSwitch;
+                        Application.ApplicationExit -= OnApplicationExit;
+                    }
+
+                    disposed = true;
+                }
+
+                base.Dispose(disposing);
             }
         }
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
